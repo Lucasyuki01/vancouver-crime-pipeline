@@ -66,12 +66,30 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
     df["month"] = pd.to_numeric(df["month"], errors="coerce")
     df["day"] = pd.to_numeric(df.get("day", pd.Series(dtype=float)), errors="coerce")
 
-    # Coordinates (offset by VPD for privacy — still useful for heatmap)
+    # Coordinates — VPD uses BC Albers (EPSG:3153), convert to lat/lon (WGS84)
+    from pyproj import Transformer
+    transformer = Transformer.from_crs("EPSG:26910", "EPSG:4326", always_xy=True)
+
     df["x"] = pd.to_numeric(df.get("x", pd.Series(dtype=float)), errors="coerce")
     df["y"] = pd.to_numeric(df.get("y", pd.Series(dtype=float)), errors="coerce")
 
     # Flag: coords available or not (Offences Against Person have no coords)
     df["has_coords"] = df["x"].notna() & df["y"].notna()
+
+    # Convert projected coords to lon/lat where available
+    mask_coords = df["has_coords"]
+    lon, lat = transformer.transform(
+        df.loc[mask_coords, "x"].values,
+        df.loc[mask_coords, "y"].values,
+    )
+    df.loc[mask_coords, "x"] = lon
+    df.loc[mask_coords, "y"] = lat
+
+    # Sanity check — Vancouver should be around lon -123, lat 49
+    valid_range = (
+        df["x"].between(-123.3, -122.9) & df["y"].between(49.0, 49.4)
+    )
+    df.loc[mask_coords & ~valid_range, "has_coords"] = False
 
     # Crime category grouping (high level)
     property_crimes = [
