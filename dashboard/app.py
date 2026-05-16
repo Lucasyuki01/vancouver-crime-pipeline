@@ -11,7 +11,7 @@ import pandas as pd
 import streamlit as st
 import pydeck as pdk
 import plotly.express as px
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -45,7 +45,7 @@ def get_engine():
     return create_engine(url)
 
 
-# ── LOAD AGGREGATED VIEWS (fast) ──────────────────────────────────────────────
+# ── DATA FUNCTIONS ────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=86400)
 def load_by_year():
@@ -70,32 +70,6 @@ def load_types():
     df = pd.read_sql("SELECT DISTINCT type FROM crime_incidents WHERE type IS NOT NULL ORDER BY type", get_engine())
     return df["type"].tolist()
 
-
-with st.spinner("Loading data..."):
-    df_year = load_by_year()
-    df_heatmap = load_heatmap()
-    years = load_years()
-    neighbourhoods = load_neighbourhoods()
-    crime_types = load_types()
-
-# ── SIDEBAR FILTERS ───────────────────────────────────────────────────────────
-
-st.sidebar.header("Filters")
-
-selected_years = st.sidebar.slider(
-    "Year range",
-    min_value=int(min(years)),
-    max_value=int(max(years)),
-    value=(2019, int(max(years))),
-)
-
-selected_neighbourhood = st.sidebar.selectbox("Neighbourhood", ["All"] + neighbourhoods)
-selected_type = st.sidebar.selectbox("Crime type", ["All"] + crime_types)
-
-# Filter year chart in memory
-df_year_f = df_year[df_year["year"].between(selected_years[0], selected_years[1])]
-
-# Filtered queries for charts that depend on all filters
 @st.cache_data(ttl=86400)
 def load_filtered(year_min, year_max, neighbourhood, crime_type):
     engine = get_engine()
@@ -118,9 +92,43 @@ def load_filtered(year_min, year_max, neighbourhood, crime_type):
         pd.read_sql(total_q, engine).iloc[0]["total"],
     )
 
+
+# ── SIDEBAR FILTERS ───────────────────────────────────────────────────────────
+
+st.sidebar.header("Filters")
+
+years = load_years()
+neighbourhoods = load_neighbourhoods()
+crime_types = load_types()
+
+selected_years = st.sidebar.slider(
+    "Year range",
+    min_value=int(min(years)),
+    max_value=int(max(years)),
+    value=(2019, int(max(years))),
+)
+selected_neighbourhood = st.sidebar.selectbox("Neighbourhood", ["All"] + neighbourhoods)
+selected_type = st.sidebar.selectbox("Crime type", ["All"] + crime_types)
+
+
+# ── LOAD DATA WITH PROGRESS BAR ───────────────────────────────────────────────
+
+progress = st.progress(0, text="Connecting to database...")
+
+df_year = load_by_year()
+progress.progress(25, text="Loading crime trends...")
+
+df_heatmap = load_heatmap()
+progress.progress(50, text="Loading heatmap data...")
+
 df_type_f, df_neigh_f, df_month_f, total_filtered = load_filtered(
     selected_years[0], selected_years[1], selected_neighbourhood, selected_type
 )
+progress.progress(100, text="Done!")
+progress.empty()
+
+df_year_f = df_year[df_year["year"].between(selected_years[0], selected_years[1])]
+
 
 # ── KPI ROW ───────────────────────────────────────────────────────────────────
 
@@ -150,21 +158,12 @@ if len(df_heatmap) > 0:
         threshold=0.05,
         radius_pixels=30,
     )
-
-    view_state = pdk.ViewState(
-        latitude=49.2487,
-        longitude=-123.1153,
-        zoom=11,
-        pitch=0,
-    )
-
-    st.pydeck_chart(
-        pdk.Deck(
-            layers=[heatmap_layer],
-            initial_view_state=view_state,
-            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
-        )
-    )
+    view_state = pdk.ViewState(latitude=49.2487, longitude=-123.1153, zoom=11, pitch=0)
+    st.pydeck_chart(pdk.Deck(
+        layers=[heatmap_layer],
+        initial_view_state=view_state,
+        map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
+    ))
     st.caption(f"Plotting {len(df_heatmap):,} incidents with valid coordinates.")
 else:
     st.info("No incidents with valid coordinates match your current filters.")
