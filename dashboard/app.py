@@ -11,7 +11,6 @@ import pandas as pd
 import streamlit as st
 import pydeck as pdk
 import plotly.express as px
-import plotly.graph_objects as go
 from sqlalchemy import create_engine, text
 from dotenv import load_dotenv
 
@@ -46,22 +45,43 @@ def get_engine():
     return create_engine(url)
 
 
-@st.cache_data(ttl=3600)
-def load_data() -> pd.DataFrame:
-    engine = get_engine()
-    query = "SELECT * FROM crime_incidents"
-    return pd.read_sql(query, engine)
+# ── LOAD AGGREGATED VIEWS (fast) ──────────────────────────────────────────────
+
+@st.cache_data(ttl=86400)
+def load_by_year():
+    return pd.read_sql("SELECT * FROM v_incidents_by_year", get_engine())
+
+@st.cache_data(ttl=86400)
+def load_heatmap():
+    return pd.read_sql("SELECT x AS lon, y AS lat FROM v_heatmap", get_engine())
+
+@st.cache_data(ttl=86400)
+def load_years():
+    df = pd.read_sql("SELECT DISTINCT year FROM crime_incidents WHERE year IS NOT NULL ORDER BY year", get_engine())
+    return df["year"].astype(int).tolist()
+
+@st.cache_data(ttl=86400)
+def load_neighbourhoods():
+    df = pd.read_sql("SELECT DISTINCT neighbourhood FROM crime_incidents WHERE neighbourhood IS NOT NULL ORDER BY neighbourhood", get_engine())
+    return df["neighbourhood"].tolist()
+
+@st.cache_data(ttl=86400)
+def load_types():
+    df = pd.read_sql("SELECT DISTINCT type FROM crime_incidents WHERE type IS NOT NULL ORDER BY type", get_engine())
+    return df["type"].tolist()
 
 
-# ── LOAD & FILTER ─────────────────────────────────────────────────────────────
+with st.spinner("Loading data..."):
+    df_year = load_by_year()
+    df_heatmap = load_heatmap()
+    years = load_years()
+    neighbourhoods = load_neighbourhoods()
+    crime_types = load_types()
 
-with st.spinner("Loading data from database..."):
-    df = load_data()
+# ── SIDEBAR FILTERS ───────────────────────────────────────────────────────────
 
-# Sidebar filters
 st.sidebar.header("Filters")
 
-years = sorted(df["year"].dropna().astype(int).unique())
 selected_years = st.sidebar.slider(
     "Year range",
     min_value=int(min(years)),
@@ -69,27 +89,45 @@ selected_years = st.sidebar.slider(
     value=(2019, int(max(years))),
 )
 
-neighbourhoods = ["All"] + sorted(df["neighbourhood"].dropna().unique())
-selected_neighbourhood = st.sidebar.selectbox("Neighbourhood", neighbourhoods)
+selected_neighbourhood = st.sidebar.selectbox("Neighbourhood", ["All"] + neighbourhoods)
+selected_type = st.sidebar.selectbox("Crime type", ["All"] + crime_types)
 
-crime_types = ["All"] + sorted(df["type"].dropna().unique())
-selected_type = st.sidebar.selectbox("Crime type", crime_types)
+# Filter year chart in memory
+df_year_f = df_year[df_year["year"].between(selected_years[0], selected_years[1])]
 
-# Apply filters
-mask = (df["year"] >= selected_years[0]) & (df["year"] <= selected_years[1])
-if selected_neighbourhood != "All":
-    mask &= df["neighbourhood"] == selected_neighbourhood
-if selected_type != "All":
-    mask &= df["type"] == selected_type
+# Filtered queries for charts that depend on all filters
+@st.cache_data(ttl=86400)
+def load_filtered(year_min, year_max, neighbourhood, crime_type):
+    engine = get_engine()
+    conditions = [f"year BETWEEN {year_min} AND {year_max}"]
+    if neighbourhood != "All":
+        conditions.append(f"neighbourhood = '{neighbourhood}'")
+    if crime_type != "All":
+        conditions.append(f"type = '{crime_type}'")
+    where = " AND ".join(conditions)
 
-filtered = df[mask]
+    type_q = f"SELECT type, COUNT(*) AS incident_count FROM crime_incidents WHERE {where} GROUP BY type ORDER BY incident_count DESC LIMIT 10"
+    neigh_q = f"SELECT neighbourhood, COUNT(*) AS incident_count FROM crime_incidents WHERE {where} GROUP BY neighbourhood ORDER BY incident_count DESC"
+    month_q = f"SELECT month, COUNT(*) AS incident_count FROM crime_incidents WHERE {where} GROUP BY month ORDER BY month"
+    total_q = f"SELECT COUNT(*) AS total FROM crime_incidents WHERE {where}"
+
+    return (
+        pd.read_sql(type_q, engine),
+        pd.read_sql(neigh_q, engine),
+        pd.read_sql(month_q, engine),
+        pd.read_sql(total_q, engine).iloc[0]["total"],
+    )
+
+df_type_f, df_neigh_f, df_month_f, total_filtered = load_filtered(
+    selected_years[0], selected_years[1], selected_neighbourhood, selected_type
+)
 
 # ── KPI ROW ───────────────────────────────────────────────────────────────────
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("Total Incidents", f"{len(filtered):,}")
-col2.metric("Crime Types", filtered["type"].nunique())
-col3.metric("Neighbourhoods", filtered["neighbourhood"].nunique())
+col1.metric("Total Incidents", f"{int(total_filtered):,}")
+col2.metric("Crime Types", int(df_type_f["type"].nunique()))
+col3.metric("Neighbourhoods", int(df_neigh_f["neighbourhood"].nunique()))
 col4.metric("Years Covered", f"{selected_years[0]}–{selected_years[1]}")
 
 st.divider()
@@ -103,17 +141,10 @@ st.caption(
     "Offences Against a Person are excluded from the map due to VPD privacy offsetting."
 )
 
-map_df = filtered[filtered["has_coords"] == True].dropna(subset=["x", "y"])
-map_df = map_df.rename(columns={"x": "lon", "y": "lat"})
-
-# VPD uses BC Albers projection — need to check if coords are lat/lon or projected
-# Typical VPD export uses lat/lon (WGS84). Values around -123, 49 are Vancouver.
-map_df = map_df[(map_df["lat"].between(49.0, 49.4)) & (map_df["lon"].between(-123.3, -122.9))]
-
-if len(map_df) > 0:
+if len(df_heatmap) > 0:
     heatmap_layer = pdk.Layer(
         "HeatmapLayer",
-        data=map_df[["lat", "lon"]],
+        data=df_heatmap,
         get_position=["lon", "lat"],
         aggregation="MEAN",
         threshold=0.05,
@@ -134,91 +165,58 @@ if len(map_df) > 0:
             map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
         )
     )
-    st.caption(f"Plotting {len(map_df):,} incidents with valid coordinates.")
+    st.caption(f"Plotting {len(df_heatmap):,} incidents with valid coordinates.")
 else:
     st.info("No incidents with valid coordinates match your current filters.")
 
 st.divider()
 
-# ── CHARTS ROW ────────────────────────────────────────────────────────────────
+# ── CHARTS ────────────────────────────────────────────────────────────────────
 
 left, right = st.columns(2)
 
-# Trend over time
 with left:
     st.subheader("📈 Incidents by Year")
-    trend = filtered.groupby("year").size().reset_index(name="count")
     fig_trend = px.bar(
-        trend, x="year", y="count",
+        df_year_f, x="year", y="incident_count",
         color_discrete_sequence=["#e63946"],
-        labels={"year": "Year", "count": "Incidents"},
+        labels={"year": "Year", "incident_count": "Incidents"},
     )
-    fig_trend.update_layout(
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        showlegend=False,
-    )
+    fig_trend.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
     st.plotly_chart(fig_trend, use_container_width=True)
 
-# By crime type
 with right:
     st.subheader("🏷️ Top Crime Types")
-    top_types = (
-        filtered["type"].value_counts().head(10).reset_index()
-    )
-    top_types.columns = ["type", "count"]
     fig_types = px.bar(
-        top_types, x="count", y="type",
+        df_type_f, x="incident_count", y="type",
         orientation="h",
         color_discrete_sequence=["#457b9d"],
-        labels={"count": "Incidents", "type": "Crime Type"},
+        labels={"incident_count": "Incidents", "type": "Crime Type"},
     )
-    fig_types.update_layout(
-        yaxis={"categoryorder": "total ascending"},
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        showlegend=False,
-    )
+    fig_types.update_layout(yaxis={"categoryorder": "total ascending"}, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
     st.plotly_chart(fig_types, use_container_width=True)
 
-# Neighbourhood ranking
 st.subheader("📍 Incidents by Neighbourhood")
-neighbourhood_counts = (
-    filtered.groupby("neighbourhood").size()
-    .reset_index(name="count")
-    .sort_values("count", ascending=False)
-)
 fig_n = px.bar(
-    neighbourhood_counts,
-    x="neighbourhood", y="count",
+    df_neigh_f, x="neighbourhood", y="incident_count",
     color_discrete_sequence=["#2a9d8f"],
-    labels={"neighbourhood": "Neighbourhood", "count": "Incidents"},
+    labels={"neighbourhood": "Neighbourhood", "incident_count": "Incidents"},
 )
-fig_n.update_layout(
-    xaxis_tickangle=-35,
-    plot_bgcolor="rgba(0,0,0,0)",
-    paper_bgcolor="rgba(0,0,0,0)",
-    showlegend=False,
-)
+fig_n.update_layout(xaxis_tickangle=-35, plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)", showlegend=False)
 st.plotly_chart(fig_n, use_container_width=True)
 
-# Monthly seasonality
 st.subheader("📅 Seasonal Pattern (by Month)")
 month_map = {1:"Jan",2:"Feb",3:"Mar",4:"Apr",5:"May",6:"Jun",
              7:"Jul",8:"Aug",9:"Sep",10:"Oct",11:"Nov",12:"Dec"}
-monthly = filtered.groupby("month").size().reset_index(name="count")
-monthly["month_name"] = monthly["month"].map(month_map)
+df_month_f["month_name"] = df_month_f["month"].map(month_map)
 fig_m = px.line(
-    monthly, x="month", y="count",
+    df_month_f, x="month", y="incident_count",
     markers=True,
     color_discrete_sequence=["#e9c46a"],
-    labels={"month": "Month", "count": "Avg Incidents"},
+    labels={"month": "Month", "incident_count": "Incidents"},
 )
 fig_m.update_xaxes(tickvals=list(range(1, 13)), ticktext=list(month_map.values()))
-fig_m.update_layout(
-    plot_bgcolor="rgba(0,0,0,0)",
-    paper_bgcolor="rgba(0,0,0,0)",
-)
+fig_m.update_layout(plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)")
 st.plotly_chart(fig_m, use_container_width=True)
 
 # ── FOOTER ────────────────────────────────────────────────────────────────────
