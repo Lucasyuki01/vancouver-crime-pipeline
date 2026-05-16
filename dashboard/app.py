@@ -131,7 +131,7 @@ if len(map_df) > 0:
         pdk.Deck(
             layers=[heatmap_layer],
             initial_view_state=view_state,
-            map_style="mapbox://styles/mapbox/dark-v10",
+            map_style="https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json",
         )
     )
     st.caption(f"Plotting {len(map_df):,} incidents with valid coordinates.")
